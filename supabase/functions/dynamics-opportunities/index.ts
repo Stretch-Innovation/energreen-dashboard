@@ -60,6 +60,17 @@ function mapOpportunity(d: Record<string, unknown>) {
   };
 }
 
+// ── Resolve lead by Dynamics ID → returns { id, gh_code, campaign_type } or null
+async function resolveLead(dynamicsId: string | null): Promise<{ id: string; gh_code: string | null; campaign_type: string | null } | null> {
+  if (!dynamicsId) return null;
+  const { data } = await supabase
+    .from("leads")
+    .select("id, gh_code, campaign_type")
+    .eq("dynamics_id", dynamicsId)
+    .single();
+  return data ?? null;
+}
+
 // ── Process a single opportunity ─────────────────────────────────────
 async function processOpportunity(data: Record<string, unknown>) {
   const mapped = mapOpportunity(data);
@@ -67,32 +78,45 @@ async function processOpportunity(data: Record<string, unknown>) {
     return { success: false, dynamics_id: null, error: "No opportunityid found" };
   }
 
-  // Link to lead and inherit gh_code + campaign_type
-  let leadId = null;
-  let ghCode = null;
-  let campaignType = null;
-  const originatingLeadDynamicsId = findField(data, "_originatingleadid_value");
-  if (originatingLeadDynamicsId) {
-    const { data: lead } = await supabase
-      .from("leads")
-      .select("id, gh_code, campaign_type")
-      .eq("dynamics_id", originatingLeadDynamicsId)
-      .single();
-    if (lead) {
-      leadId = lead.id;
-      ghCode = lead.gh_code;
-      campaignType = lead.campaign_type;
-    }
+  // Store the originating lead's Dynamics GUID (always save, even if lead not yet in DB)
+  const originatingLeadDynamicsId =
+    findField(data, "_originatingleadid_value") ||
+    findField(data, "originatingleadid") ||
+    findField(data, "_msdyn_originatingleadid_value");
+
+  // Also try parent contact as fallback for lead matching
+  const parentContactDynamicsId = findField(data, "_parentcontactid_value");
+
+  // Resolve lead_id: first by originating lead, then by parent contact
+  let lead = await resolveLead(originatingLeadDynamicsId);
+  if (!lead && parentContactDynamicsId) {
+    // Some opportunities link to a contact that was imported as a lead
+    lead = await resolveLead(parentContactDynamicsId);
   }
 
-  const result = await supabase.from("opportunities").upsert(
-    { ...mapped, lead_id: leadId, gh_code: ghCode, campaign_type: campaignType },
-    { onConflict: "dynamics_id" }
-  );
+  // If still no match and we have a name, try name-based matching as last resort
+  if (!lead && mapped.originating_lead_name) {
+    const { data: nameMatch } = await supabase
+      .from("leads")
+      .select("id, gh_code, campaign_type")
+      .ilike("full_name", mapped.originating_lead_name.trim())
+      .limit(1);
+    if (nameMatch && nameMatch.length > 0) lead = nameMatch[0];
+  }
+
+  const upsertData = {
+    ...mapped,
+    originating_lead_dynamics_id: originatingLeadDynamicsId,
+    lead_id: lead?.id ?? null,
+    gh_code: lead?.gh_code ?? mapped.gh_code ?? null,
+    campaign_type: lead?.campaign_type ?? mapped.campaign_type ?? null,
+  };
+
+  const result = await supabase.from("opportunities").upsert(upsertData, { onConflict: "dynamics_id" });
   if (result.error) {
     return { success: false, dynamics_id: mapped.dynamics_id, error: result.error.message };
   }
-  return { success: true, dynamics_id: mapped.dynamics_id };
+  return { success: true, dynamics_id: mapped.dynamics_id, lead_matched: !!lead };
 }
 
 // ── Handler ──────────────────────────────────────────────────────────
